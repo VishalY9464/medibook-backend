@@ -1,0 +1,97 @@
+# ==========================================
+# MediBook - Spring Boot .gitignore
+# ==========================================
+
+# ==========================================
+# MAVEN
+# ==========================================
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# ==========================================
+# STS / ECLIPSE IDE
+# ==========================================
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache/
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+# ==========================================
+# INTELLIJ IDEA
+# ==========================================
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+# ==========================================
+# VS CODE
+# ==========================================
+.vscode/
+
+# ==========================================
+# OS GENERATED FILES
+# ==========================================
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+
+# ==========================================
+# ENVIRONMENT FILES
+# ==========================================
+.env
+.env.local
+.env.dev
+.env.prod
+*.env
+
+# ==========================================
+# LOGS
+# ==========================================
+*.log
+logs/
+spring-shell.log
+
+# ==========================================
+# TEST REPORTS
+# ==========================================
+/test-output/
+surefire-reports/
+
+# ==========================================
+# UPLOADS / TEMP
+# ==========================================
+uploads/
+temp/
+generated/
