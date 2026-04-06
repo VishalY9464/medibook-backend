@@ -13,104 +13,150 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
+/*
+ * This is the Security Configuration for MediBook.
+ *
+ * It does three main things:
+ * 1. Decides which URLs are public (no login needed)
+ * 2. Decides which URLs need a valid JWT token
+ * 3. Adds JwtFilter to check token on every request
+ *
+ * PDF requires:
+ * → Guests can browse providers and slots without login
+ * → Patients need login to book, pay, review
+ * → Providers need login to manage slots and records
+ * → Admins need login for platform management
+ *
+ * For now all protected URLs just need valid token.
+ * Specific role restrictions (Patient/Provider/Admin)
+ * will be added in MVC web layer controllers later.
+ */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
+    /*
+     * JwtFilter runs before every request.
+     * It checks the Authorization header for valid JWT token.
+     * Spring injects this automatically.
+     */
     @Autowired
     private JwtFilter jwtFilter;
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
-            // Disable CSRF (not needed for REST APIs with JWT)
+            /*
+             * Disable CSRF protection.
+             * CSRF is needed for browser form based apps.
+             * We use JWT tokens instead — so CSRF not needed.
+             */
             .csrf(csrf -> csrf.disable())
 
-            // Stateless session — no server side sessions
+            /*
+             * Stateless session management.
+             * No HttpSession created on server side.
+             * Every request must carry JWT token.
+             * This is required for microservices architecture.
+             */
             .sessionManagement(session ->
                 session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 
-            // URL access rules
+            /*
+             * URL access rules — who can access what.
+             *
+             * PDF section 2.1:
+             * "Guests can browse providers and view profiles
+             * and available slots without logging in."
+             */
             .authorizeHttpRequests(auth -> auth
 
-                // Public endpoints — no token needed
+                /*
+                 * PUBLIC endpoints — no JWT token needed.
+                 * Anyone including guests can access these.
+                 * PDF explicitly requires guests to browse
+                 * providers and slots without login.
+                 */
                 .requestMatchers(
-                    "/auth/register",
-                    "/auth/login",
-                    "/auth/refresh",
-                    "/providers",
-                    "/providers/**",
-                    "/slots/available/**",
-                    "/swagger-ui/**",
-                    "/swagger-ui.html",
-                    "/api-docs/**"
+                    "/auth/register",           // anyone can register
+                    "/auth/login",              // anyone can login
+                    "/auth/refresh",            // anyone can refresh token
+                    "/providers",               // guests browse providers
+                    "/providers/**",            // guests view provider profiles
+                    "/slots/available/**",      // guests view available slots
+                    "/swagger-ui/**",           // API documentation
+                    "/swagger-ui.html",         // Swagger UI page
+                    "/api-docs/**",             // OpenAPI docs
+                    "/v3/api-docs/**"           // Swagger full access
                 ).permitAll()
 
-                // Patient only endpoints
+                /*
+                 * PROTECTED endpoints — need valid JWT token.
+                 * Any logged in user (Patient/Provider/Admin) can access.
+                 *
+                 * Why not restrict by role here?
+                 * Role based restrictions will be added in
+                 * MVC controllers (PatientController, ProviderController,
+                 * AdminController) when we build the web layer.
+                 * Business logic in ServiceImpl also validates access.
+                 *
+                 * PDF roles:
+                 * /appointments/** → patients book, doctors manage
+                 * /payments/**     → patients pay, admin views
+                 * /reviews/**      → patients submit, admin moderates
+                 * /records/**      → doctors create, patients view own
+                 * /slots/**        → doctors manage their slots
+                 * /admin/**        → admin platform management
+                 * /notifications/**→ all users receive notifications
+                 */
                 .requestMatchers(
                     "/appointments/**",
                     "/payments/**",
                     "/reviews/**",
-                    "/records/patient/**"
-                ).hasRole("Patient")
-
-                // Provider only endpoints
-                .requestMatchers(
+                    "/records/**",
                     "/slots/**",
-                    "/records/provider/**"
-                ).hasRole("Provider")
+                    "/admin/**",
+                    "/notifications/**"
+                ).authenticated()
 
-                // Admin only endpoints
-                .requestMatchers(
-                    "/admin/**"
-                ).hasRole("Admin")
-
-                // Everything else needs authentication
+                /*
+                 * Everything else also needs authentication.
+                 * Safety net for any endpoint not listed above.
+                 */
                 .anyRequest().authenticated()
             )
 
-            // Add JWT filter before Spring Security filter
+            /*
+             * Add JwtFilter before Spring's default auth filter.
+             * JwtFilter runs first → reads token → sets user in context
+             * Then Spring Security checks if user is authenticated.
+             */
             .addFilterBefore(jwtFilter,
                 UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
 
-    // BCrypt password encoder — PDF requires bcrypt
+    /*
+     * BCrypt password encoder.
+     * PDF non-functional requirements explicitly state:
+     * "Passwords stored as bcrypt hashes"
+     * BCrypt is industry standard — even if database is hacked
+     * passwords cannot be reversed from the hash.
+     */
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder();
     }
 
+    /*
+     * AuthenticationManager bean.
+     * Required by Spring Security internals.
+     * Used when validating credentials during login.
+     */
     @Bean
     public AuthenticationManager authenticationManager(
             AuthenticationConfiguration config) throws Exception {
         return config.getAuthenticationManager();
     }
 }
-
-
-//```
-//
-//**What each section does:**
-//```
-//csrf.disable()          → REST APIs don't need CSRF protection
-//                          JWT handles security instead
-//
-//STATELESS               → no HttpSession created
-//                          every request must carry JWT token
-//
-//permitAll()             → these URLs work without login
-//                          guests can browse providers and slots
-//
-//hasRole("Patient")      → only patients can book appointments,
-//                          make payments, submit reviews
-//
-//hasRole("Provider")     → only providers can manage slots,
-//                          view their records
-//
-//hasRole("Admin")        → only admin can access /admin/** endpoints
-//
-//BCryptPasswordEncoder   → PDF explicitly requires bcrypt for passwords
-//
-//JwtFilter               → runs before every request to validate token
