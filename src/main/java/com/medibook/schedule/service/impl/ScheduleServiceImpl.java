@@ -1,5 +1,7 @@
 package com.medibook.schedule.service.impl;
 
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.ResourceNotFoundException;
 import com.medibook.schedule.dto.SlotRequest;
 import com.medibook.schedule.entity.AvailabilitySlot;
 import com.medibook.schedule.repository.SlotRepository;
@@ -19,27 +21,14 @@ import java.util.List;
  * ScheduleService (interface) says WHAT needs to be done.
  * This class actually DOES it — adds slots, blocks them, releases them.
  *
- * Key things happening here:
- * → Doctor adds time slots to their calendar
- * → Slots can be individual or recurring (daily/weekly)
- * → Patients see only available slots (not booked, not blocked)
- * → When patient books → slot marked as booked
- * → When patient cancels → slot released back
- * → Expired slots cleaned up automatically
- *
- * @Transactional on bookSlot() is critical.
- * It ensures the entire booking operation is atomic.
- * Either the whole thing succeeds or nothing changes.
- * Combined with @Version on entity → prevents double booking.
+ * Exception handling:
+ * → ResourceNotFoundException → 404 when slot not found
+ * → BadRequestException       → 400 when business rule violated
+ * All caught by GlobalExceptionHandler → clean JSON response always
  */
 @Service
 public class ScheduleServiceImpl implements ScheduleService {
 
-    /*
-     * SlotRepository is our connection to availability_slots table.
-     * Spring injects this automatically.
-     * We never create it manually with new keyword.
-     */
     @Autowired
     private SlotRepository slotRepository;
 
@@ -47,23 +36,20 @@ public class ScheduleServiceImpl implements ScheduleService {
      * Add a single time slot for a doctor.
      *
      * How it works:
-     * 1. Take slot details from request
+     * 1. Validate date is not in the past
      * 2. Build AvailabilitySlot object
      * 3. Set defaults — isBooked=false, isBlocked=false
      * 4. Save to database and return
-     *
-     * Why check for past date?
-     * No point creating slots in the past.
-     * Patients cannot book them anyway.
      */
     @Override
     public AvailabilitySlot addSlot(SlotRequest request) {
 
         // do not allow creating slots in the past
-        // past slots are useless — patients cannot book them
+        // throws 400 Bad Request if date is in the past
         if (request.getDate().isBefore(LocalDate.now())) {
-            throw new RuntimeException(
-                "Cannot create slot in the past. Please select a future date."
+            throw new BadRequestException(
+                "Cannot create slot in the past. " +
+                "Please select a future date."
             );
         }
 
@@ -81,50 +67,43 @@ public class ScheduleServiceImpl implements ScheduleService {
                 .isBlocked(false)
                 .build();
 
-        // save to database and return saved slot with generated slotId
+        // save to database and return saved slot
         return slotRepository.save(slot);
     }
 
     /*
      * Add multiple slots at once.
      *
-     * How it works:
      * Doctor sends a list of slot requests.
      * We loop through each one and save them all.
-     * More efficient than calling addSlot() separately for each.
-     *
-     * Example use case:
-     * Doctor adds slots for Monday, Wednesday, Friday
-     * all at once instead of three separate API calls.
+     * More efficient than calling addSlot() separately.
      */
     @Override
-    public List<AvailabilitySlot> addBulkSlots(List<SlotRequest> requests) {
+    public List<AvailabilitySlot> addBulkSlots(
+            List<SlotRequest> requests) {
+
+        // validate list is not empty
+        if (requests == null || requests.isEmpty()) {
+            throw new BadRequestException(
+                "Slot list cannot be empty."
+            );
+        }
 
         // list to collect all saved slots
         List<AvailabilitySlot> savedSlots = new ArrayList<>();
 
         // loop through each request and save each slot
+        // addSlot() validates each slot individually
         for (SlotRequest request : requests) {
-
-            // reuse addSlot() logic for each request
-            // this also validates past date for each slot
             AvailabilitySlot slot = addSlot(request);
             savedSlots.add(slot);
         }
 
-        // return all saved slots
         return savedSlots;
     }
 
     /*
      * Generate recurring slots automatically.
-     *
-     * How it works:
-     * Doctor sets:
-     * → start date (example: April 1)
-     * → end date (example: April 30)
-     * → recurrence pattern (DAILY or WEEKLY)
-     * → time and duration for each slot
      *
      * DAILY  → creates one slot every day from start to end date
      * WEEKLY → creates one slot every week on same day of week
@@ -132,24 +111,33 @@ public class ScheduleServiceImpl implements ScheduleService {
      * Example:
      * Doctor sets Monday 10:00-10:30 WEEKLY from April 1 to April 30
      * → System creates: April 7, April 14, April 21, April 28
-     * All automatically without doctor doing it manually.
-     *
-     * This saves doctor enormous time for regular schedules.
      */
     @Override
-    public List<AvailabilitySlot> generateRecurringSlots(SlotRequest request) {
+    public List<AvailabilitySlot> generateRecurringSlots(
+            SlotRequest request) {
 
         // recurrence end date is required for recurring slots
         if (request.getRecurrenceEndDate() == null) {
-            throw new RuntimeException(
+            throw new BadRequestException(
                 "Recurrence end date is required for recurring slots."
             );
         }
 
         // end date must be after start date
-        if (request.getRecurrenceEndDate().isBefore(request.getDate())) {
-            throw new RuntimeException(
+        if (request.getRecurrenceEndDate()
+                .isBefore(request.getDate())) {
+            throw new BadRequestException(
                 "Recurrence end date must be after start date."
+            );
+        }
+
+        // recurrence pattern must be DAILY or WEEKLY
+        String recurrence = request.getRecurrence();
+        if (recurrence == null
+                || (!recurrence.equals("DAILY")
+                    && !recurrence.equals("WEEKLY"))) {
+            throw new BadRequestException(
+                "Recurrence pattern must be DAILY or WEEKLY."
             );
         }
 
@@ -179,119 +167,95 @@ public class ScheduleServiceImpl implements ScheduleService {
             generatedSlots.add(slotRepository.save(slot));
 
             // move to next date based on recurrence pattern
-            if (request.getRecurrence().equals("DAILY")) {
-                // daily → move to next day
+            if (recurrence.equals("DAILY")) {
                 currentDate = currentDate.plusDays(1);
-
-            } else if (request.getRecurrence().equals("WEEKLY")) {
-                // weekly → move to same day next week
-                currentDate = currentDate.plusWeeks(1);
-
             } else {
-                // unknown recurrence pattern → stop loop
-                break;
+                // WEEKLY → move to same day next week
+                currentDate = currentDate.plusWeeks(1);
             }
         }
 
-        // return all generated slots
         return generatedSlots;
     }
 
     /*
      * Get all slots for a specific doctor.
-     *
-     * Doctor uses this to view their complete schedule.
      * Returns everything — booked, blocked, and available.
      * Doctor needs to see all of them to manage their calendar.
      */
     @Override
     public List<AvailabilitySlot> getSlotsByProvider(int providerId) {
-
-        // get all slots for this doctor from database
         return slotRepository.findByProviderId(providerId);
     }
 
     /*
      * Get only available slots for a doctor on a specific date.
-     *
+     * Only slots that are not booked and not blocked.
      * This is what patients see when they pick a date.
-     * Only slots that are:
-     * → not booked (isBooked = false)
-     * → not blocked (isBlocked = false)
-     * are shown to patients.
-     *
-     * Blocked and booked slots are completely hidden from patients.
      */
     @Override
     public List<AvailabilitySlot> getAvailableSlots(
-            int providerId,
-            LocalDate date) {
+            int providerId, LocalDate date) {
 
-        // get only available slots for this doctor on this date
-        // repository query handles the isBooked=false and isBlocked=false filter
+        // validate date is not null
+        if (date == null) {
+            throw new BadRequestException(
+                "Date cannot be null."
+            );
+        }
+
         return slotRepository.findAvailableByProviderAndDate(
-                providerId,
-                date
+                providerId, date
         );
     }
 
     /*
      * Get a single slot by its ID.
-     *
-     * Used when:
-     * → Patient books an appointment (UC4 calls this)
-     * → Doctor updates or deletes a specific slot
-     * → Admin views slot details
-     *
-     * Throws exception if slot not found.
-     * Exception will be handled by GlobalExceptionHandler later.
+     * Throws 404 Not Found if slot does not exist.
+     * Called internally by bookSlot, blockSlot, deleteSlot etc.
      */
     @Override
     public AvailabilitySlot getSlotById(int slotId) {
 
-        // find slot by id — throw exception if not found
+        // throws 404 Not Found if slot not found
         return slotRepository.findBySlotId(slotId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Slot not found with id: " + slotId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Slot", "id", slotId
                 ));
     }
 
     /*
      * Mark a slot as booked.
+     * Called by AppointmentService in UC4.
      *
-     * This is called by AppointmentService in UC4
-     * when a patient confirms their booking.
-     *
-     * @Transactional is very important here.
-     * It means: do everything or do nothing.
-     * If anything fails → database rolls back to original state.
-     *
-     * @Version on AvailabilitySlot handles double booking.
-     * If two patients try to book same slot simultaneously:
-     * → First one saves → version becomes 1
-     * → Second one tries → sees version mismatch → exception
+     * @Transactional ensures atomic operation.
+     * @Version on entity prevents double booking.
+     * If two patients try simultaneously:
+     * → First saves → version = 1
+     * → Second tries → version mismatch → exception
      * → Only first patient gets the slot
-     * → This is the PDF data integrity requirement
      */
     @Override
     @Transactional
     public void bookSlot(int slotId) {
 
-        // find the slot
+        // find the slot — throws 404 if not found
         AvailabilitySlot slot = getSlotById(slotId);
 
         // check if slot is already booked
-        // this is a safety check on top of optimistic locking
+        // safety check on top of optimistic locking
         if (slot.isBooked()) {
-            throw new RuntimeException(
-                "This slot is already booked. Please choose another slot."
+            throw new BadRequestException(
+                "This slot is already booked. " +
+                "Please choose another slot."
             );
         }
 
         // check if slot is blocked by doctor
         if (slot.isBlocked()) {
-            throw new RuntimeException(
-                "This slot is blocked by the doctor and cannot be booked."
+            throw new BadRequestException(
+                "This slot is blocked by the doctor " +
+                "and cannot be booked."
             );
         }
 
@@ -299,28 +263,23 @@ public class ScheduleServiceImpl implements ScheduleService {
         slot.setBooked(true);
 
         // save — @Version automatically increments
-        // if another transaction saved first → OptimisticLockException
+        // concurrent booking attempt → OptimisticLockException
         slotRepository.save(slot);
     }
 
     /*
      * Release a booked slot back to available.
-     *
-     * Called by AppointmentService in UC4
-     * when patient cancels their appointment.
-     *
-     * Slot becomes available again immediately
-     * so another patient can book it.
+     * Called by AppointmentService when patient cancels.
+     * Slot becomes available immediately for other patients.
      */
     @Override
     @Transactional
     public void releaseSlot(int slotId) {
 
-        // find the slot
+        // find the slot — throws 404 if not found
         AvailabilitySlot slot = getSlotById(slotId);
 
         // set isBooked back to false
-        // slot is now available for other patients to book
         slot.setBooked(false);
 
         // save updated slot
@@ -329,27 +288,27 @@ public class ScheduleServiceImpl implements ScheduleService {
 
     /*
      * Doctor blocks a slot for personal unavailability.
-     *
-     * Doctor might have:
-     * → A meeting during that time
-     * → Personal appointment
-     * → Break time
-     *
      * Blocked slot becomes INVISIBLE to patients.
-     * Patients cannot see or book it.
-     * This is a strict PDF requirement.
+     * Cannot block already booked slot.
      */
     @Override
     public void blockSlot(int slotId) {
 
-        // find the slot
+        // find the slot — throws 404 if not found
         AvailabilitySlot slot = getSlotById(slotId);
 
-        // cannot block a slot that is already booked
-        // patient has already booked it — cannot block now
+        // cannot block a slot already booked by patient
         if (slot.isBooked()) {
-            throw new RuntimeException(
-                "Cannot block a slot that is already booked by a patient."
+            throw new BadRequestException(
+                "Cannot block a slot that is already " +
+                "booked by a patient."
+            );
+        }
+
+        // check if already blocked
+        if (slot.isBlocked()) {
+            throw new BadRequestException(
+                "Slot is already blocked."
             );
         }
 
@@ -357,49 +316,56 @@ public class ScheduleServiceImpl implements ScheduleService {
         // slot disappears from patient view immediately
         slot.setBlocked(true);
 
-        // save updated slot
         slotRepository.save(slot);
     }
 
     /*
      * Doctor unblocks a previously blocked slot.
-     *
-     * Doctor blocked a slot earlier but now wants
-     * to make it available again.
      * Sets isBlocked back to false.
      * Slot appears in patient search immediately.
      */
     @Override
     public void unblockSlot(int slotId) {
 
-        // find the slot
+        // find the slot — throws 404 if not found
         AvailabilitySlot slot = getSlotById(slotId);
 
+        // check if already unblocked
+        if (!slot.isBlocked()) {
+            throw new BadRequestException(
+                "Slot is not blocked."
+            );
+        }
+
         // set isBlocked back to false
-        // slot is now visible and bookable by patients
         slot.setBlocked(false);
 
-        // save updated slot
         slotRepository.save(slot);
     }
 
     /*
      * Update slot details.
-     *
-     * Doctor wants to change the time or duration of a slot.
      * Cannot update if patient has already booked it.
-     * That would be unfair to the patient who booked.
      */
     @Override
-    public AvailabilitySlot updateSlot(int slotId, SlotRequest request) {
+    public AvailabilitySlot updateSlot(
+            int slotId, SlotRequest request) {
 
-        // find existing slot
+        // find existing slot — throws 404 if not found
         AvailabilitySlot existing = getSlotById(slotId);
 
-        // cannot update a slot that patient has already booked
+        // cannot update a slot already booked by patient
         if (existing.isBooked()) {
-            throw new RuntimeException(
-                "Cannot update a slot that is already booked by a patient."
+            throw new BadRequestException(
+                "Cannot update a slot that is already " +
+                "booked by a patient."
+            );
+        }
+
+        // validate new date is not in the past
+        if (request.getDate().isBefore(LocalDate.now())) {
+            throw new BadRequestException(
+                "Cannot update slot to a past date."
             );
         }
 
@@ -409,51 +375,35 @@ public class ScheduleServiceImpl implements ScheduleService {
         existing.setEndTime(request.getEndTime());
         existing.setDurationMinutes(request.getDurationMinutes());
 
-        // save and return updated slot
         return slotRepository.save(existing);
     }
 
     /*
      * Delete a slot permanently from calendar.
-     *
-     * Doctor removes a slot they no longer need.
      * Cannot delete if patient has already booked it.
-     * Patient would lose their appointment — not allowed.
      */
     @Override
     @Transactional
     public void deleteSlot(int slotId) {
 
-        // find the slot first to make sure it exists
+        // find the slot — throws 404 if not found
         AvailabilitySlot slot = getSlotById(slotId);
 
-        // cannot delete a slot that patient has already booked
+        // cannot delete a slot already booked by patient
         if (slot.isBooked()) {
-            throw new RuntimeException(
-                "Cannot delete a slot that is already booked by a patient." +
-                " Please cancel the appointment first."
+            throw new BadRequestException(
+                "Cannot delete a slot that is already booked " +
+                "by a patient. Please cancel the appointment first."
             );
         }
 
-        // delete slot from database
         slotRepository.deleteBySlotId(slotId);
     }
 
     /*
      * Delete all expired slots automatically.
-     *
-     * Expired slots = past date AND never booked.
-     * These are useless — no patient will ever book them.
-     * Keeping them wastes database space.
-     *
-     * This method is called by SlotExpiryScheduler
-     * which runs automatically every night at midnight.
-     * Doctor and patient never call this manually.
-     *
-     * Example:
-     * Dr. Sharma had a slot on March 1 at 10:00.
-     * No patient booked it. March 1 is now past.
-     * This method deletes it automatically.
+     * Called by SlotExpiryScheduler every night at midnight.
+     * Expired = past date AND never booked.
      */
     @Override
     @Transactional

@@ -3,6 +3,8 @@ package com.medibook.notification.service.impl;
 import com.medibook.notification.dto.NotificationRequest;
 import com.medibook.auth.repository.UserRepository;
 import com.medibook.auth.entity.User;
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.ResourceNotFoundException;
 import com.medibook.notification.entity.Notification;
 import com.medibook.notification.repository.NotificationRepository;
 import com.medibook.notification.service.NotificationService;
@@ -37,12 +39,37 @@ public class NotificationServiceImpl implements NotificationService {
 
     /*
      * Send a single notification.
-     * 1. Always save to database
-     * 2. If channel = EMAIL → look up user email → send real email
-     * 3. If channel = SMS → mock log
+     * 1. Validate request
+     * 2. Always save to database
+     * 3. If channel = EMAIL → look up user email → send real email
+     * 4. If channel = SMS → mock log
      */
     @Override
     public Notification send(NotificationRequest request) {
+
+        // validate channel is one of allowed values
+        String channel = request.getChannel();
+        if (!channel.equals("APP")
+                && !channel.equals("EMAIL")
+                && !channel.equals("SMS")) {
+            throw new BadRequestException(
+                "Invalid channel. Allowed values: APP, EMAIL, SMS"
+            );
+        }
+
+        // validate type is one of allowed values
+        String type = request.getType();
+        if (!type.equals("BOOKING")
+                && !type.equals("REMINDER")
+                && !type.equals("CANCELLATION")
+                && !type.equals("PAYMENT")
+                && !type.equals("FOLLOWUP")
+                && !type.equals("ANNOUNCEMENT")) {
+            throw new BadRequestException(
+                "Invalid type. Allowed values: BOOKING, REMINDER, " +
+                "CANCELLATION, PAYMENT, FOLLOWUP, ANNOUNCEMENT"
+            );
+        }
 
         // step 1 — always save to database
         Notification notification = Notification.builder()
@@ -62,24 +89,27 @@ public class NotificationServiceImpl implements NotificationService {
         if ("EMAIL".equals(request.getChannel()) && emailEnabled) {
             try {
                 // look up actual patient email from users table
+                // throws ResourceNotFoundException if user not found
                 User user = userRepository
                         .findById(request.getRecipientId())
-                        .orElse(null);
+                        .orElseThrow(() -> new ResourceNotFoundException(
+                            "User", "id", request.getRecipientId()
+                        ));
 
-                if (user != null) {
-                    sendEmail(
-                        user.getEmail(),       // real patient email from DB
-                        request.getTitle(),
-                        request.getMessage()
-                    );
-                } else {
-                    System.out.println("User not found for recipientId: "
-                            + request.getRecipientId());
-                }
+                sendEmail(
+                    user.getEmail(),
+                    request.getTitle(),
+                    request.getMessage()
+                );
+
+            } catch (ResourceNotFoundException e) {
+                // rethrow resource not found — caller should know
+                throw e;
             } catch (Exception e) {
                 // email failure should NOT fail the notification
                 // notification is already saved to DB
-                System.out.println("Email sending failed: " + e.getMessage());
+                System.out.println("Email sending failed: "
+                        + e.getMessage());
             }
         }
 
@@ -99,6 +129,26 @@ public class NotificationServiceImpl implements NotificationService {
     public void sendBulk(List<Integer> recipientIds,
                          String title, String message) {
 
+        // validate list is not empty
+        if (recipientIds == null || recipientIds.isEmpty()) {
+            throw new BadRequestException(
+                "Recipient list cannot be empty."
+            );
+        }
+
+        // validate title and message
+        if (title == null || title.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Title cannot be empty."
+            );
+        }
+
+        if (message == null || message.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Message cannot be empty."
+            );
+        }
+
         for (int recipientId : recipientIds) {
             NotificationRequest request = new NotificationRequest();
             request.setRecipientId(recipientId);
@@ -116,11 +166,19 @@ public class NotificationServiceImpl implements NotificationService {
     @Override
     public void markAsRead(int notificationId) {
 
+        // throws 404 Not Found if notification not found
         Notification notification = notificationRepository
                 .findById(notificationId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Notification not found: " + notificationId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Notification", "id", notificationId
                 ));
+
+        // check if already read
+        if (notification.isRead()) {
+            throw new BadRequestException(
+                "Notification is already marked as read."
+            );
+        }
 
         notification.setRead(true);
         notificationRepository.save(notification);
@@ -157,6 +215,13 @@ public class NotificationServiceImpl implements NotificationService {
      */
     @Override
     public void deleteNotification(int notificationId) {
+
+        // throws 404 Not Found if notification not found
+        notificationRepository.findById(notificationId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Notification", "id", notificationId
+                ));
+
         notificationRepository.deleteByNotificationId(notificationId);
     }
 
@@ -165,7 +230,16 @@ public class NotificationServiceImpl implements NotificationService {
      * toEmail = real patient email fetched from users table.
      */
     @Override
-    public void sendEmail(String toEmail, String subject, String body) {
+    public void sendEmail(String toEmail,
+                          String subject, String body) {
+
+        // validate email is not empty
+        if (toEmail == null || toEmail.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Recipient email cannot be empty."
+            );
+        }
+
         try {
             SimpleMailMessage mail = new SimpleMailMessage();
             mail.setFrom(senderEmail);
@@ -186,6 +260,14 @@ public class NotificationServiceImpl implements NotificationService {
      */
     @Override
     public void sendSms(String phoneNumber, String message) {
+
+        // validate phone number is not empty
+        if (phoneNumber == null || phoneNumber.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Phone number cannot be empty."
+            );
+        }
+
         System.out.println("SMS MOCK → To: "
                 + phoneNumber
                 + " | Message: " + message);

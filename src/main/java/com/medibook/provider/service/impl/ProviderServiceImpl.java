@@ -1,5 +1,8 @@
 package com.medibook.provider.service.impl;
 
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.DuplicateResourceException;
+import com.medibook.exception.ResourceNotFoundException;
 import com.medibook.provider.dto.ProviderRequest;
 import com.medibook.provider.entity.Provider;
 import com.medibook.provider.repository.ProviderRepository;
@@ -22,16 +25,16 @@ import java.util.List;
  *
  * @Service tells Spring to manage this class as a bean.
  * Spring will automatically inject it wherever ProviderService is needed.
+ *
+ * Exception handling:
+ * → ResourceNotFoundException  → 404 when entity not found
+ * → DuplicateResourceException → 409 when entity already exists
+ * → BadRequestException        → 400 when business rule violated
+ * All caught by GlobalExceptionHandler → clean JSON response always
  */
 @Service
 public class ProviderServiceImpl implements ProviderService {
 
-    /*
-     * We inject ProviderRepository here.
-     * This gives us all the database query methods we defined.
-     * @Autowired tells Spring to automatically provide this dependency.
-     * We never create ProviderRepository manually — Spring handles it.
-     */
     @Autowired
     private ProviderRepository providerRepository;
 
@@ -40,7 +43,7 @@ public class ProviderServiceImpl implements ProviderService {
      *
      * How it works:
      * 1. Check if provider profile already exists for this userId
-     *    (one user cannot have two provider profiles)
+     *    one user cannot have two provider profiles
      * 2. Build Provider object from request data
      * 3. Set default values — isVerified=false, isAvailable=true
      * 4. Save to database and return
@@ -54,14 +57,15 @@ public class ProviderServiceImpl implements ProviderService {
 
         // check if this user already has a provider profile
         // one user account can only have one doctor profile
-        if (providerRepository.findByUserId(request.getUserId()).isPresent()) {
-            throw new RuntimeException(
-                "Provider profile already exists for this user"
+        // throws 409 Conflict if profile already exists
+        if (providerRepository.findByUserId(
+                request.getUserId()).isPresent()) {
+            throw new DuplicateResourceException(
+                "Provider profile", "userId", request.getUserId()
             );
         }
 
         // build the provider object from the request data
-        // we use builder pattern because Provider has @Builder annotation
         Provider provider = Provider.builder()
                 .userId(request.getUserId())
                 .specialization(request.getSpecialization())
@@ -71,7 +75,7 @@ public class ProviderServiceImpl implements ProviderService {
                 .clinicName(request.getClinicName())
                 .clinicAddress(request.getClinicAddress())
                 // new doctor starts with zero rating
-                // this updates automatically when patients review
+                // updates automatically when patients review
                 .avgRating(0.0)
                 // admin must verify before doctor appears in search
                 // this is a PDF requirement
@@ -80,69 +84,68 @@ public class ProviderServiceImpl implements ProviderService {
                 .isAvailable(true)
                 .build();
 
-        // save to database and return the saved provider
-        // saved provider will have the auto generated providerId
+        // save to database and return saved provider
+        // saved provider will have auto generated providerId
         return providerRepository.save(provider);
     }
 
     /*
      * Get a single provider by their providerId.
      *
-     * How it works:
-     * 1. Call repository to find provider by ID
-     * 2. If not found — throw exception with clear message
-     * 3. If found — return the provider object
-     *
      * Used when patient clicks on a doctor to view full profile.
+     * Throws 404 if provider not found.
      */
     @Override
     public Provider getProviderById(int providerId) {
 
-        // find provider by ID or throw exception if not found
-        // orElseThrow gives a clean error instead of returning null
+        // find provider by ID
+        // throws 404 Not Found if not found
         return providerRepository.findById(providerId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Provider not found with ID: " + providerId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Provider", "id", providerId
                 ));
     }
 
     /*
      * Get provider profile by their userId.
      *
-     * How it works:
      * Doctor logs in → JWT gives us userId
-     * We use that userId to find their provider profile
-     *
-     * Different from getProviderById because:
-     * providerId = provider table ID
-     * userId = user table ID (from login)
+     * We use that userId to find their provider profile.
+     * Throws 404 if provider profile not found.
      */
     @Override
     public Provider getProviderByUserId(int userId) {
 
-        // find provider by userId or throw exception
+        // find provider by userId
+        // throws 404 Not Found if not found
         return providerRepository.findByUserId(userId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Provider profile not found for user ID: " + userId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Provider", "userId", userId
                 ));
     }
 
     /*
      * Get all doctors with a specific specialization.
      *
-     * How it works:
-     * Patient selects Cardiologist from dropdown
-     * We return all verified doctors with that specialization
-     *
-     * We filter by isVerified=true because
-     * unverified doctors should never appear to patients.
+     * Patient selects Cardiologist from dropdown.
+     * Returns only verified doctors with that specialization.
+     * Unverified doctors never appear to patients — PDF rule.
      */
     @Override
     public List<Provider> getBySpecialization(String specialization) {
 
+        // validate specialization is not empty
+        if (specialization == null
+                || specialization.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Specialization cannot be empty."
+            );
+        }
+
         // get all doctors with this specialization
-        // then filter to show only verified ones to patients
-        return providerRepository.findBySpecialization(specialization)
+        // filter to show only verified ones to patients
+        return providerRepository
+                .findBySpecialization(specialization)
                 .stream()
                 .filter(Provider::isVerified)
                 .toList();
@@ -151,10 +154,9 @@ public class ProviderServiceImpl implements ProviderService {
     /*
      * Search doctors by name or specialization keyword.
      *
-     * How it works:
-     * Patient types anything in search bar
-     * We search both doctor name and specialization
-     * Returns matching results
+     * Patient types anything in search bar.
+     * We search both doctor name and specialization.
+     * Returns matching results.
      *
      * Example:
      * "heart" → finds all Cardiologists
@@ -164,30 +166,45 @@ public class ProviderServiceImpl implements ProviderService {
     @Override
     public List<Provider> searchProviders(String keyword) {
 
-        // use the custom @Query we wrote in repository
+        // validate keyword is not empty
+        if (keyword == null || keyword.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Search keyword cannot be empty."
+            );
+        }
+
+        // use custom @Query in repository
         // searches both name and specialization in one query
-        return providerRepository.searchByNameOrSpecialization(keyword);
+        return providerRepository
+                .searchByNameOrSpecialization(keyword);
     }
 
     /*
      * Update provider profile details.
      *
      * How it works:
-     * 1. Find existing provider by ID
+     * 1. Find existing provider by ID — throws 404 if not found
      * 2. Update only the fields that came in request
      * 3. Save and return updated provider
      *
-     * Note: we do not update isVerified or avgRating here
-     * those are updated by separate methods
+     * Doctor cannot update isVerified or avgRating directly.
+     * Those are updated by separate methods.
      */
     @Override
-    public Provider updateProvider(int providerId, ProviderRequest request) {
+    public Provider updateProvider(
+            int providerId, ProviderRequest request) {
 
-        // first find the existing provider
-        // throws exception if not found
+        // find existing provider — throws 404 if not found
         Provider existing = getProviderById(providerId);
 
-        // update only the fields that doctor is allowed to change
+        // validate experience years is not negative
+        if (request.getExperienceYears() < 0) {
+            throw new BadRequestException(
+                "Experience years cannot be negative."
+            );
+        }
+
+        // update only the fields doctor is allowed to change
         // doctor cannot change their own verification status
         existing.setSpecialization(request.getSpecialization());
         existing.setQualification(request.getQualification());
@@ -215,8 +232,15 @@ public class ProviderServiceImpl implements ProviderService {
     @Override
     public void verifyProvider(int providerId) {
 
-        // find the provider first
+        // find the provider — throws 404 if not found
         Provider provider = getProviderById(providerId);
+
+        // check if already verified — no need to verify twice
+        if (provider.isVerified()) {
+            throw new BadRequestException(
+                "Provider is already verified."
+            );
+        }
 
         // set verified to true — doctor is now approved
         provider.setVerified(true);
@@ -228,15 +252,14 @@ public class ProviderServiceImpl implements ProviderService {
     /*
      * Doctor sets their own availability status.
      *
-     * How it works:
      * Doctor going on leave → sets isAvailable = false
      * Doctor comes back → sets isAvailable = true
-     * Patients only see available doctors in search
+     * Patients only see available doctors in search.
      */
     @Override
     public void setAvailability(int providerId, boolean isAvailable) {
 
-        // find the provider first
+        // find the provider — throws 404 if not found
         Provider provider = getProviderById(providerId);
 
         // update availability status
@@ -249,18 +272,15 @@ public class ProviderServiceImpl implements ProviderService {
     /*
      * Delete a provider profile from the platform.
      *
-     * How it works:
-     * Admin decides to remove a doctor
-     * We delete their provider profile from database
-     *
-     * Note: this only deletes provider profile
-     * their user account in users table is separate
+     * Admin decides to remove a doctor.
+     * Deletes only provider profile.
+     * User account in users table is separate.
      */
     @Override
     public void deleteProvider(int providerId) {
 
         // check provider exists before deleting
-        // throws exception if not found
+        // throws 404 if not found
         getProviderById(providerId);
 
         // delete from database
@@ -270,17 +290,21 @@ public class ProviderServiceImpl implements ProviderService {
     /*
      * Update the average rating of a doctor.
      *
-     * How it works:
-     * Patient submits a review → ReviewService calls this
-     * We update the avgRating field on provider
-     *
-     * This is called from ReviewServiceImpl (UC6)
-     * every time a new review is submitted.
+     * Called from ReviewServiceImpl (UC6)
+     * every time a new review is submitted or deleted.
+     * Validates rating is within 0 to 5 range.
      */
     @Override
     public void updateRating(int providerId, double newRating) {
 
-        // find the provider first
+        // validate rating range
+        if (newRating < 0.0 || newRating > 5.0) {
+            throw new BadRequestException(
+                "Rating must be between 0.0 and 5.0."
+            );
+        }
+
+        // find the provider — throws 404 if not found
         Provider provider = getProviderById(providerId);
 
         // update the average rating
@@ -295,7 +319,7 @@ public class ProviderServiceImpl implements ProviderService {
      *
      * Used by admin to see complete list of all doctors.
      * Admin can see both verified and unverified doctors.
-     * Patients only see verified doctors (different method).
+     * Patients only see verified doctors via different method.
      */
     @Override
     public List<Provider> getAllProviders() {
@@ -308,7 +332,7 @@ public class ProviderServiceImpl implements ProviderService {
     /*
      * Get all verified and available providers.
      *
-     * This is the main method used for patient search.
+     * Main method used for patient search.
      * Both conditions must be true:
      * → isVerified = true (admin approved)
      * → isAvailable = true (doctor accepting patients)
@@ -320,6 +344,7 @@ public class ProviderServiceImpl implements ProviderService {
 
         // only return doctors who are both verified AND available
         // this is the patient facing search result
-        return providerRepository.findByIsVerifiedAndIsAvailable(true, true);
+        return providerRepository
+                .findByIsVerifiedAndIsAvailable(true, true);
     }
 }

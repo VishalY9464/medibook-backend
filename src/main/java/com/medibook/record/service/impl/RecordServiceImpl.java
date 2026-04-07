@@ -2,6 +2,9 @@ package com.medibook.record.service.impl;
 
 import com.medibook.appointment.entity.Appointment;
 import com.medibook.appointment.repository.AppointmentRepository;
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.DuplicateResourceException;
+import com.medibook.exception.ResourceNotFoundException;
 import com.medibook.record.dto.RecordRequest;
 import com.medibook.record.entity.MedicalRecord;
 import com.medibook.record.repository.RecordRepository;
@@ -34,14 +37,16 @@ import java.util.List;
  * HIPAA compliance:
  * → createdAt and updatedAt tracked automatically
  * → audit trail maintained for all access
+ *
+ * Exception handling:
+ * → ResourceNotFoundException  → 404 when record not found
+ * → DuplicateResourceException → 409 when record already exists
+ * → BadRequestException        → 400 when business rule violated
+ * All caught by GlobalExceptionHandler → clean JSON response always
  */
 @Service
 public class RecordServiceImpl implements RecordService {
 
-    /*
-     * RecordRepository is our connection to medical_records table.
-     * Spring injects this automatically.
-     */
     @Autowired
     private RecordRepository recordRepository;
 
@@ -57,13 +62,14 @@ public class RecordServiceImpl implements RecordService {
      * Create a new medical record after appointment.
      *
      * How it works:
-     * 1. Find the appointment to verify it exists
+     * 1. Find the appointment — throws 404 if not found
      * 2. Check appointment status is COMPLETED
-     *    Cannot create record for SCHEDULED appointment
-     * 3. Check no record already exists for this appointment
-     *    One appointment can have only one record
-     * 4. Build MedicalRecord from request data
-     * 5. Save and return
+     *    throws 400 if not COMPLETED
+     * 3. Check no record already exists
+     *    throws 409 if record already exists
+     * 4. Validate required fields
+     * 5. Build MedicalRecord from request data
+     * 6. Save and return
      *
      * Why check COMPLETED status?
      * PDF explicitly says doctor creates record AFTER
@@ -73,34 +79,55 @@ public class RecordServiceImpl implements RecordService {
     @Override
     public MedicalRecord createRecord(RecordRequest request) {
 
-        // find the appointment to verify it exists
+        // step 1 — find the appointment to verify it exists
+        // throws 404 Not Found if appointment not found
         Appointment appointment = appointmentRepository
                 .findByAppointmentId(request.getAppointmentId())
-                .orElseThrow(() -> new RuntimeException(
-                    "Appointment not found with id: "
-                    + request.getAppointmentId()
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Appointment", "id", request.getAppointmentId()
                 ));
 
-        // appointment must be COMPLETED before creating record
-        // cannot create record for scheduled or cancelled appointment
-        if (!appointment.getStatus().equals("COMPLETED")) {
-            throw new RuntimeException(
-                "Medical record can only be created for COMPLETED appointments. " +
-                "Current status: " + appointment.getStatus()
+        // step 2 — appointment must be COMPLETED
+        // throws 400 Bad Request if not COMPLETED
+        if (!appointment.getStatus()
+                .equalsIgnoreCase("COMPLETED")) {
+            throw new BadRequestException(
+                "Medical record can only be created for " +
+                "COMPLETED appointments. Current status: "
+                + appointment.getStatus()
             );
         }
 
-        // check if record already exists for this appointment
+        // step 3 — check if record already exists
         // one appointment can have only one medical record
+        // throws 409 Conflict if record already exists
         if (recordRepository.existsByAppointmentId(
                 request.getAppointmentId())) {
-            throw new RuntimeException(
+            throw new DuplicateResourceException(
                 "Medical record already exists for appointment: "
                 + request.getAppointmentId()
             );
         }
 
-        // build medical record from request data
+        // step 4 — validate required fields
+        // diagnosis is mandatory for every medical record
+        if (request.getDiagnosis() == null
+                || request.getDiagnosis().trim().isEmpty()) {
+            throw new BadRequestException(
+                "Diagnosis is required for medical record."
+            );
+        }
+
+        // follow up date cannot be in the past
+        if (request.getFollowUpDate() != null
+                && request.getFollowUpDate()
+                    .isBefore(LocalDate.now())) {
+            throw new BadRequestException(
+                "Follow up date cannot be in the past."
+            );
+        }
+
+        // step 5 — build medical record from request data
         MedicalRecord record = MedicalRecord.builder()
                 .appointmentId(request.getAppointmentId())
                 .patientId(request.getPatientId())
@@ -112,26 +139,26 @@ public class RecordServiceImpl implements RecordService {
                 .followUpDate(request.getFollowUpDate())
                 .build();
 
-        // save and return record with generated recordId
+        // step 6 — save and return with generated recordId
         return recordRepository.save(record);
     }
 
     /*
      * Get medical record by appointment ID.
      *
-     * Doctor views record they created for specific appointment.
+     * Doctor views record for specific appointment.
      * Patient views record from their appointment history.
-     * Throws exception if record not found.
+     * Throws 404 if record not found for this appointment.
      */
     @Override
-    public MedicalRecord getRecordByAppointment(int appointmentId) {
+    public MedicalRecord getRecordByAppointment(
+            int appointmentId) {
 
-        // find record by appointmentId
-        // throw exception if record does not exist yet
-        return recordRepository.findByAppointmentId(appointmentId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Medical record not found for appointment: "
-                    + appointmentId
+        // throws 404 Not Found if record not found
+        return recordRepository
+                .findByAppointmentId(appointmentId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "MedicalRecord", "appointmentId", appointmentId
                 ));
     }
 
@@ -139,15 +166,13 @@ public class RecordServiceImpl implements RecordService {
      * Get all medical records for a specific patient.
      *
      * Returns records ordered by newest first.
-     * Most recent consultation appears at the top.
      * PDF rule: patient sees ONLY their own records.
-     * This is enforced by querying by patientId.
-     * Patient cannot access records of other patients.
+     * Enforced by querying by patientId.
      */
     @Override
-    public List<MedicalRecord> getRecordsByPatient(int patientId) {
+    public List<MedicalRecord> getRecordsByPatient(
+            int patientId) {
 
-        // get all records for this patient newest first
         return recordRepository
                 .findByPatientIdOrderByCreatedAtDesc(patientId);
     }
@@ -155,15 +180,13 @@ public class RecordServiceImpl implements RecordService {
     /*
      * Get all records created by a specific doctor.
      *
-     * Doctor sees all consultations they have documented.
      * PDF rule: doctor sees ONLY records they created.
-     * This is enforced by querying by providerId.
-     * Doctor cannot access records they did not create.
+     * Enforced by querying by providerId.
      */
     @Override
-    public List<MedicalRecord> getRecordsByProvider(int providerId) {
+    public List<MedicalRecord> getRecordsByProvider(
+            int providerId) {
 
-        // get all records created by this doctor
         return recordRepository.findByProviderId(providerId);
     }
 
@@ -174,14 +197,15 @@ public class RecordServiceImpl implements RecordService {
      * → Doctor updates specific record
      * → Admin views record for audit compliance
      * → Patient views specific record details
+     * Throws 404 if record not found.
      */
     @Override
     public MedicalRecord getRecordById(int recordId) {
 
-        // find record by recordId
+        // throws 404 Not Found if record not found
         return recordRepository.findByRecordId(recordId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Medical record not found with id: " + recordId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "MedicalRecord", "id", recordId
                 ));
     }
 
@@ -189,26 +213,41 @@ public class RecordServiceImpl implements RecordService {
      * Update an existing medical record.
      *
      * How it works:
-     * 1. Find existing record
-     * 2. Update only the fields doctor is allowed to change
-     * 3. Save and return updated record
+     * 1. Find existing record — throws 404 if not found
+     * 2. Validate required fields
+     * 3. Validate follow up date is not in past
+     * 4. Update only medical content fields
+     * 5. Save and return updated record
      *
-     * Why not update appointmentId patientId providerId?
-     * These are immutable — they link record to the right
-     * appointment patient and doctor.
-     * Changing them would break data integrity.
+     * Never update appointmentId patientId providerId.
+     * These are immutable — protect data integrity.
      *
      * PDF says doctor can edit within allowed time window.
-     * Time window check can be added here later.
-     * For now we allow editing — evaluators understand.
+     * Time window check added here later.
      */
     @Override
     public MedicalRecord updateRecord(
-            int recordId,
-            RecordRequest request) {
+            int recordId, RecordRequest request) {
 
-        // find existing record
+        // find existing record — throws 404 if not found
         MedicalRecord existing = getRecordById(recordId);
+
+        // validate diagnosis is not empty
+        if (request.getDiagnosis() == null
+                || request.getDiagnosis().trim().isEmpty()) {
+            throw new BadRequestException(
+                "Diagnosis cannot be empty."
+            );
+        }
+
+        // validate follow up date is not in the past
+        if (request.getFollowUpDate() != null
+                && request.getFollowUpDate()
+                    .isBefore(LocalDate.now())) {
+            throw new BadRequestException(
+                "Follow up date cannot be in the past."
+            );
+        }
 
         // update only the medical content fields
         // never update appointmentId patientId providerId
@@ -219,26 +258,24 @@ public class RecordServiceImpl implements RecordService {
         existing.setFollowUpDate(request.getFollowUpDate());
 
         // save — @PreUpdate automatically updates updatedAt
-        // this tracks when doctor last edited the record
-        // part of HIPAA audit trail PDF requires
+        // tracks when doctor last edited — HIPAA audit trail
         return recordRepository.save(existing);
     }
 
     /*
      * Delete a medical record.
      *
-     * Only admin can delete records.
+     * Only admin can delete records — PDF requirement.
      * Doctors cannot delete medical records.
-     * This protects medical record integrity.
-     * Used for compliance management by admin.
-     *
-     * In the web layer we will add role check
-     * to ensure only admin can call this endpoint.
+     * Protects medical record integrity.
+     * Role check enforced in web layer UC.
+     * Throws 404 if record not found.
      */
     @Override
     public void deleteRecord(int recordId) {
 
         // verify record exists before deleting
+        // throws 404 Not Found if record not found
         getRecordById(recordId);
 
         // delete record from database
@@ -248,68 +285,73 @@ public class RecordServiceImpl implements RecordService {
     /*
      * Attach a document URL to existing record.
      *
-     * How it works:
      * Doctor uploads lab report or X-ray to AWS S3.
      * Gets back a URL from S3.
-     * Calls this method to attach URL to medical record.
+     * Calls this to attach URL to medical record.
      * Updates only the attachmentUrl field.
-     * Everything else stays unchanged.
-     *
-     * In production: real S3 URL stored here.
-     * In development: mock URL or local path works fine.
+     * Throws 404 if record not found.
+     * Throws 400 if URL is empty.
      */
     @Override
-    public void attachDocument(int recordId, String attachmentUrl) {
+    public void attachDocument(
+            int recordId, String attachmentUrl) {
 
-        // find existing record
+        // validate URL is not empty
+        if (attachmentUrl == null
+                || attachmentUrl.trim().isEmpty()) {
+            throw new BadRequestException(
+                "Attachment URL cannot be empty."
+            );
+        }
+
+        // find existing record — throws 404 if not found
         MedicalRecord record = getRecordById(recordId);
 
         // update only the attachment URL
         record.setAttachmentUrl(attachmentUrl);
 
-        // save updated record
-        // @PreUpdate updates updatedAt automatically
+        // save — @PreUpdate updates updatedAt automatically
         recordRepository.save(record);
     }
 
     /*
      * Get all records with a follow up date of today.
      *
-     * How it works:
-     * Scheduler runs every night at midnight.
-     * Calls this method with today's date.
-     * Gets all records where followUpDate = today.
-     * For each record found:
-     * → sends reminder notification to patient via UC7
-     * → patient gets reminded to come for follow up
-     *
-     * This is explicit PDF requirement:
+     * Called by FollowUpReminderScheduler every night.
+     * For each record found → sends reminder to patient via UC7.
+     * PDF explicit requirement:
      * "Records with follow up date trigger automated
      * reminder notification to patient on that date"
      */
     @Override
     public List<MedicalRecord> getFollowUpRecords(LocalDate date) {
 
-        // find all records with follow up date equal to given date
+        // validate date is not null
+        if (date == null) {
+            throw new BadRequestException(
+                "Date cannot be null."
+            );
+        }
+
+        // find all records with follow up date = given date
         return recordRepository.findByFollowUpDate(date);
     }
 
     /*
      * Get upcoming follow up records for a patient.
      *
-     * Shows patient which follow up appointments
-     * are coming up in the future.
-     * Helps doctor track patients who need follow up.
-     * Returns all records with future follow up dates.
+     * Shows patient which follow ups are coming soon.
+     * Helps doctor track patients needing follow up.
+     * Returns all records with today or future follow up dates.
      */
     @Override
-    public List<MedicalRecord> getUpcomingFollowUps(int patientId) {
+    public List<MedicalRecord> getUpcomingFollowUps(
+            int patientId) {
 
         // get all upcoming follow ups for this patient
         // today and future dates only
         return recordRepository.findUpcomingFollowUps(
-                patientId,
-                LocalDate.now()
+                patientId, LocalDate.now()
         );
     }
 
@@ -323,8 +365,8 @@ public class RecordServiceImpl implements RecordService {
     @Override
     public int getRecordCount(int patientId) {
 
-        // count all records for this patient
         // cast long to int — count never exceeds int range
-        return (int) recordRepository.countByPatientId(patientId);
+        return (int) recordRepository
+                .countByPatientId(patientId);
     }
 }

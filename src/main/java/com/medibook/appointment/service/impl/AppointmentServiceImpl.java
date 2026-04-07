@@ -4,6 +4,8 @@ import com.medibook.appointment.dto.AppointmentRequest;
 import com.medibook.appointment.entity.Appointment;
 import com.medibook.appointment.repository.AppointmentRepository;
 import com.medibook.appointment.service.AppointmentService;
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.ResourceNotFoundException;
 import com.medibook.schedule.entity.AvailabilitySlot;
 import com.medibook.schedule.service.ScheduleService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,21 +27,17 @@ import java.util.List;
  *
  * Key connections to other services:
  * → ScheduleService (UC3) → to book and release slots
- * → PaymentService (UC5)  → will be added when UC5 is built
- * → NotificationService   → will be added when UC7 is built
+ * → PaymentService (UC5)  → refund on cancellation
+ * → NotificationService (UC7) → notifications on all events
  *
- * @Transactional on bookAppointment and cancelAppointment
- * is critical — if anything fails midway,
- * database rolls back to original state.
- * No half completed bookings ever.
+ * Exception handling:
+ * → ResourceNotFoundException → 404 when appointment not found
+ * → BadRequestException       → 400 when business rule violated
+ * All caught by GlobalExceptionHandler → clean JSON response always
  */
 @Service
 public class AppointmentServiceImpl implements AppointmentService {
 
-    /*
-     * AppointmentRepository — our connection to appointments table.
-     * Spring injects this automatically.
-     */
     @Autowired
     private AppointmentRepository appointmentRepository;
 
@@ -73,27 +71,33 @@ public class AppointmentServiceImpl implements AppointmentService {
     public Appointment bookAppointment(AppointmentRequest request) {
 
         // get the slot from UC3 to verify it exists
+        // throws 404 if slot not found
         AvailabilitySlot slot = scheduleService
                 .getSlotById(request.getSlotId());
 
         // verify slot is not already booked by another patient
+        // throws 400 Bad Request if already booked
         if (slot.isBooked()) {
-            throw new RuntimeException(
-                "This slot is already booked. Please choose another slot."
+            throw new BadRequestException(
+                "This slot is already booked. " +
+                "Please choose another slot."
             );
         }
 
         // verify slot is not blocked by the doctor
+        // throws 400 Bad Request if blocked
         if (slot.isBlocked()) {
-            throw new RuntimeException(
-                "This slot is blocked by the doctor. Please choose another slot."
+            throw new BadRequestException(
+                "This slot is blocked by the doctor. " +
+                "Please choose another slot."
             );
         }
 
         // verify slot belongs to the requested provider
         // patient cannot book a slot from a different doctor
+        // throws 400 Bad Request if provider mismatch
         if (slot.getProviderId() != request.getProviderId()) {
-            throw new RuntimeException(
+            throw new BadRequestException(
                 "This slot does not belong to the selected doctor."
             );
         }
@@ -130,80 +134,69 @@ public class AppointmentServiceImpl implements AppointmentService {
      * Used when viewing appointment details.
      * Also used by Payment and MedicalRecord services
      * to verify appointment exists before linking.
+     * Throws 404 if appointment not found.
      */
     @Override
     public Appointment getById(int appointmentId) {
 
-        // find appointment — throw exception if not found
+        // find appointment — throws 404 Not Found if not found
         return appointmentRepository
                 .findByAppointmentId(appointmentId)
-                .orElseThrow(() -> new RuntimeException(
-                    "Appointment not found with id: " + appointmentId
+                .orElseThrow(() -> new ResourceNotFoundException(
+                    "Appointment", "id", appointmentId
                 ));
     }
 
     /*
      * Get all appointments for a specific patient.
-     *
      * Patient views their complete appointment history.
      * Shows all statuses — scheduled, completed, cancelled.
-     * Patient uses this to track their medical visits.
      */
     @Override
     public List<Appointment> getByPatient(int patientId) {
-
-        // get all appointments for this patient from database
         return appointmentRepository.findByPatientId(patientId);
     }
 
     /*
      * Get all appointments for a specific doctor.
-     *
      * Doctor views all their bookings on dashboard.
-     * Includes past and upcoming appointments.
      * Admin uses this to monitor doctor workload.
      */
     @Override
     public List<Appointment> getByProvider(int providerId) {
-
-        // get all appointments for this doctor from database
         return appointmentRepository.findByProviderId(providerId);
     }
 
     /*
      * Get all appointments for a doctor on a specific date.
-     *
      * Doctor views their schedule for a specific day.
      * Most commonly used for today's appointments.
-     * Shown on provider dashboard as daily schedule.
      */
     @Override
     public List<Appointment> getByProviderAndDate(
-            int providerId,
-            LocalDate date) {
+            int providerId, LocalDate date) {
 
-        // get all appointments for this doctor on this specific date
+        // validate date is not null
+        if (date == null) {
+            throw new BadRequestException(
+                "Date cannot be null."
+            );
+        }
+
         return appointmentRepository
-                .findByProviderIdAndAppointmentDate(providerId, date);
+                .findByProviderIdAndAppointmentDate(
+                        providerId, date);
     }
 
     /*
      * Get all upcoming appointments for a patient.
-     *
-     * Upcoming means:
-     * → status = SCHEDULED
-     * → date is today or in the future
-     *
+     * Upcoming = status SCHEDULED and date today or future.
      * Shown on patient dashboard as upcoming appointments.
-     * Notification reminders are sent for these.
      */
     @Override
     public List<Appointment> getUpcomingByPatient(int patientId) {
-
-        // get only future scheduled appointments for this patient
         return appointmentRepository.findUpcomingByPatientId(
-                patientId,
-                LocalDate.now()
+                patientId, LocalDate.now()
         );
     }
 
@@ -211,8 +204,8 @@ public class AppointmentServiceImpl implements AppointmentService {
      * Cancel an appointment.
      *
      * How it works:
-     * 1. Find the appointment
-     * 2. Check it is SCHEDULED (cannot cancel completed)
+     * 1. Find the appointment — throws 404 if not found
+     * 2. Check it is SCHEDULED — throws 400 if not
      * 3. Change status to CANCELLED
      * 4. Save updated appointment
      * 5. Release the slot back to available in UC3
@@ -225,13 +218,13 @@ public class AppointmentServiceImpl implements AppointmentService {
     @Transactional
     public void cancelAppointment(int appointmentId) {
 
-        // find the appointment
+        // find the appointment — throws 404 if not found
         Appointment appointment = getById(appointmentId);
 
         // can only cancel scheduled appointments
-        // cannot cancel an already completed appointment
+        // throws 400 if appointment is already completed or cancelled
         if (!appointment.getStatus().equals("SCHEDULED")) {
-            throw new RuntimeException(
+            throw new BadRequestException(
                 "Only scheduled appointments can be cancelled. " +
                 "Current status: " + appointment.getStatus()
             );
@@ -249,15 +242,16 @@ public class AppointmentServiceImpl implements AppointmentService {
         scheduleService.releaseSlot(appointment.getSlotId());
 
         // TODO: trigger refund if payment was made (UC5)
-        // TODO: send cancellation notification to patient and doctor (UC7)
+        // TODO: send cancellation notification to patient
+        //       and doctor (UC7)
     }
 
     /*
      * Reschedule an appointment to a different slot.
      *
      * How it works:
-     * 1. Find the existing appointment
-     * 2. Verify it is SCHEDULED
+     * 1. Find existing appointment — throws 404 if not found
+     * 2. Verify it is SCHEDULED — throws 400 if not
      * 3. Verify new slot belongs to same doctor
      * 4. Release the old slot back to available
      * 5. Book the new slot
@@ -276,26 +270,52 @@ public class AppointmentServiceImpl implements AppointmentService {
             String newStartTime,
             String newEndTime) {
 
-        // find existing appointment
+        // find existing appointment — throws 404 if not found
         Appointment appointment = getById(appointmentId);
 
         // can only reschedule scheduled appointments
+        // throws 400 if completed or cancelled
         if (!appointment.getStatus().equals("SCHEDULED")) {
-            throw new RuntimeException(
+            throw new BadRequestException(
                 "Only scheduled appointments can be rescheduled. " +
                 "Current status: " + appointment.getStatus()
             );
         }
 
+        // validate new date is not in the past
+        if (newDate != null && newDate.isBefore(LocalDate.now())) {
+            throw new BadRequestException(
+                "Cannot reschedule to a past date."
+            );
+        }
+
         // get new slot to verify it exists and is available
-        AvailabilitySlot newSlot = scheduleService.getSlotById(newSlotId);
+        // throws 404 if new slot not found
+        AvailabilitySlot newSlot = scheduleService
+                .getSlotById(newSlotId);
 
         // new slot must belong to same doctor
         // patient cannot switch doctor by rescheduling
+        // throws 400 if provider mismatch
         if (newSlot.getProviderId() != appointment.getProviderId()) {
-            throw new RuntimeException(
+            throw new BadRequestException(
                 "Rescheduling is only allowed with the same doctor. " +
                 "Please book a new appointment for a different doctor."
+            );
+        }
+
+        // verify new slot is not already booked
+        if (newSlot.isBooked()) {
+            throw new BadRequestException(
+                "The selected new slot is already booked. " +
+                "Please choose another slot."
+            );
+        }
+
+        // verify new slot is not blocked
+        if (newSlot.isBlocked()) {
+            throw new BadRequestException(
+                "The selected new slot is blocked by the doctor."
             );
         }
 
@@ -322,8 +342,8 @@ public class AppointmentServiceImpl implements AppointmentService {
      * Doctor marks appointment as completed.
      *
      * How it works:
-     * 1. Find the appointment
-     * 2. Verify it is SCHEDULED
+     * 1. Find the appointment — throws 404 if not found
+     * 2. Verify it is SCHEDULED — throws 400 if not
      * 3. Change status to COMPLETED
      * 4. Save updated appointment
      *
@@ -335,14 +355,16 @@ public class AppointmentServiceImpl implements AppointmentService {
     @Override
     public void completeAppointment(int appointmentId) {
 
-        // find the appointment
+        // find the appointment — throws 404 if not found
         Appointment appointment = getById(appointmentId);
 
         // can only complete a scheduled appointment
+        // throws 400 if already completed or cancelled
         if (!appointment.getStatus().equals("SCHEDULED")) {
-            throw new RuntimeException(
-                "Only scheduled appointments can be marked as completed. " +
-                "Current status: " + appointment.getStatus()
+            throw new BadRequestException(
+                "Only scheduled appointments can be marked " +
+                "as completed. Current status: "
+                + appointment.getStatus()
             );
         }
 
@@ -362,7 +384,6 @@ public class AppointmentServiceImpl implements AppointmentService {
      * Used by:
      * → Admin to fix incorrect statuses
      * → NoShowDetectionScheduler to auto set NO_SHOW
-     *   for past SCHEDULED appointments nobody completed
      *
      * Valid statuses from PDF:
      * SCHEDULED / COMPLETED / CANCELLED / NO_SHOW
@@ -370,31 +391,35 @@ public class AppointmentServiceImpl implements AppointmentService {
     @Override
     public void updateStatus(int appointmentId, String status) {
 
-        // find the appointment
+        // validate status is one of the allowed values
+        if (!status.equals("SCHEDULED")
+                && !status.equals("COMPLETED")
+                && !status.equals("CANCELLED")
+                && !status.equals("NO_SHOW")) {
+            throw new BadRequestException(
+                "Invalid status. Allowed values: " +
+                "SCHEDULED, COMPLETED, CANCELLED, NO_SHOW"
+            );
+        }
+
+        // find the appointment — throws 404 if not found
         Appointment appointment = getById(appointmentId);
 
         // update to new status
         appointment.setStatus(status);
 
         // save — @PreUpdate auto updates updatedAt timestamp
-        // all status changes are tracked — PDF audit trail requirement
+        // all status changes tracked — PDF audit trail requirement
         appointmentRepository.save(appointment);
     }
 
     /*
      * Count total appointments for a doctor.
-     *
-     * Used in:
-     * → Doctor earnings dashboard
-     *   "You have handled 150 appointments total"
-     * → Admin platform analytics
-     *   to show most active doctors
+     * Used in doctor earnings dashboard and admin analytics.
      */
     @Override
     public int getAppointmentCount(int providerId) {
-
-        // count all appointments for this doctor
-        // cast long to int — count will never exceed int range
-        return (int) appointmentRepository.countByProviderId(providerId);
+        return (int) appointmentRepository
+                .countByProviderId(providerId);
     }
 }

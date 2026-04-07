@@ -2,6 +2,10 @@ package com.medibook.auth.service.impl;
 
 import com.medibook.auth.dto.AuthResponse;
 
+import com.medibook.exception.BadRequestException;
+import com.medibook.exception.DuplicateResourceException;
+import com.medibook.exception.ResourceNotFoundException;
+import com.medibook.exception.UnauthorizedException;
 import com.medibook.auth.dto.LoginRequest;
 import com.medibook.auth.dto.RegisterRequest;
 import com.medibook.auth.entity.User;
@@ -30,7 +34,9 @@ public class AuthServiceImpl implements AuthService {
 
         // Check duplicate email
         if (userRepository.existsByEmail(request.getEmail())) {
-            throw new RuntimeException("Email already registered");
+        	throw new DuplicateResourceException(
+        		    "User", "email", request.getEmail()
+        		);
         }
 
         User user = User.builder()
@@ -50,14 +56,21 @@ public class AuthServiceImpl implements AuthService {
     public AuthResponse login(LoginRequest request) {
 
         User user = userRepository.findByEmail(request.getEmail())
-                .orElseThrow(() -> new RuntimeException("User not found"));
+        		.orElseThrow(() -> new ResourceNotFoundException(
+        			    "User", "email", request.getEmail()
+        			));
 
         if (!user.isActive()) {
-            throw new RuntimeException("Account is deactivated");
+        	throw new UnauthorizedException(
+        		    "Your account has been deactivated. " +
+        		    "Please contact admin to reactivate."
+        		);
         }
 
         if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
-            throw new RuntimeException("Invalid credentials");
+        	throw new UnauthorizedException(
+        		    "Invalid email or password. Please try again."
+        		);
         }
 
         String token = jwtUtil.generateToken(
@@ -92,7 +105,9 @@ public class AuthServiceImpl implements AuthService {
     @Override
     public String refreshToken(String token) {
         if (!jwtUtil.validateToken(token)) {
-            throw new RuntimeException("Invalid token");
+        	throw new UnauthorizedException(
+        		    "Invalid or expired token. Please login again."
+        		);
         }
         String email  = jwtUtil.extractEmail(token);
         String role   = jwtUtil.extractRole(token);
@@ -104,14 +119,18 @@ public class AuthServiceImpl implements AuthService {
     @Override
     public User getUserByEmail(String email) {
         return userRepository.findByEmail(email)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+        		.orElseThrow(() -> new ResourceNotFoundException(
+        			    "User", "email", email
+        			));
     }
 
     //  getUserById()
     @Override
     public User getUserById(int userId) {
         return userRepository.findByUserId(userId)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+        		.orElseThrow(() -> new ResourceNotFoundException(
+                	    "User", "id", userId
+                		));   
     }
 
     // updateProfile()
@@ -124,14 +143,33 @@ public class AuthServiceImpl implements AuthService {
         return userRepository.save(existing);
     }
 
-    //  changePassword()
     @Override
     public void changePassword(int userId, String newPassword) {
+        
+        // find user — throws ResourceNotFoundException if not found
         User user = getUserById(userId);
+        
+        // validate new password is not empty
+        if (newPassword == null || newPassword.trim().isEmpty()) {
+            throw new BadRequestException(
+                "New password cannot be empty."
+            );
+        }
+        
+        // validate minimum password length
+        if (newPassword.length() < 6) {
+            throw new BadRequestException(
+                "Password must be at least 6 characters long."
+            );
+        }
+        
+        // encode new password with BCrypt
         user.setPasswordHash(passwordEncoder.encode(newPassword));
+        
+        
+        // save updated user
         userRepository.save(user);
     }
-
     //  deactivateAccount()
     @Override
     public void deactivateAccount(int userId) {
